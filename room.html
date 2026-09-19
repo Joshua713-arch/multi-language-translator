@@ -1,0 +1,195 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="message-box">
+  <button type="button" id="leave-btn" class="btn red" onclick="leaveRoom()">Leave Room</button>
+  <h2>Chat Room: {{ code }}</h2>
+  <div class="messages" id="messages"></div>
+  <div class="inputs">
+    <input type="file" id="file-input" accept=".pdf" hidden>
+    <button type="button" id="attach-btn" class="btn blue" onclick="document.getElementById('file-input').click()">Attach .pdf</button>
+    <input type="text" placeholder="Message" name="message" id="message" autocomplete="off" maxlength="2000">
+    <button type="button" id="send-btn" class="btn green" onclick="sendMessage()">Send</button>
+  </div>
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+  const socketio = io();
+  const messages = document.getElementById("messages");
+  const statusEl = document.getElementById("status");
+  const username = {{ session['name'] | tojson }};
+  const myLanguage = {{ session['language'] | tojson }};
+  let leaving = false;
+
+  // ------------------------------------------------------------ translation
+  // Each browser translates into its own language using Google Translate,
+  // so requests come from each user's own internet connection. If that
+  // fails, the server is asked to translate instead.
+
+  const cache = new Map();
+  let browserCanTranslate = true;
+
+  const splitText = (text, limit = 1000) => {
+    const chunks = [];
+    let current = "";
+    for (let line of text.split(/(?<=\n)/)) {
+      while (line.length > limit) {
+        if (current) { chunks.push(current); current = ""; }
+        chunks.push(line.slice(0, limit));
+        line = line.slice(limit);
+      }
+      if (current.length + line.length > limit) { chunks.push(current); current = ""; }
+      current += line;
+    }
+    if (current.trim()) chunks.push(current);
+    return chunks;
+  };
+
+  const googleInBrowser = async (text) => {
+    const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t"
+      + "&tl=" + encodeURIComponent(myLanguage) + "&q=" + encodeURIComponent(text);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    return data[0].map((part) => part[0] || "").join("");
+  };
+
+  const viaServer = (text) => new Promise((resolve, reject) => {
+    socketio.timeout(30000).emit("translate", { text, dest: myLanguage }, (err, resp) => {
+      if (err || !resp || !resp.ok) reject(new Error((resp && resp.error) || "server translation failed"));
+      else resolve(resp.text);
+    });
+  });
+
+  const translateChunk = async (text) => {
+    if (browserCanTranslate) {
+      try {
+        return await googleInBrowser(text);
+      } catch (e) {
+        // TypeError = blocked or offline: stop trying from the browser for this visit.
+        if (e instanceof TypeError) browserCanTranslate = false;
+      }
+    }
+    return await viaServer(text);
+  };
+
+  const translateText = async (text) => {
+    if (!text || !text.trim()) return text;
+    if (cache.has(text)) return cache.get(text);
+    const parts = [];
+    for (const chunk of splitText(text)) parts.push(await translateChunk(chunk));
+    const result = parts.join("");
+    cache.set(text, result);
+    return result;
+  };
+
+  // ------------------------------------------------------------- rendering
+  // Build each message with textContent so user input is never run as HTML.
+  // The bubble is added immediately and filled in once translated, so
+  // messages always stay in the order they were sent.
+
+  const addBubble = (name, isOwnMessage) => {
+    const wrap = document.createElement("div");
+    wrap.className = "message " + (isOwnMessage ? "text-right" : "text-left");
+    const who = document.createElement("div");
+    who.className = "name";
+    who.textContent = name;
+    const text = document.createElement("div");
+    text.className = "text pending";
+    text.textContent = "translating…";
+    wrap.append(who, text);
+    messages.appendChild(wrap);
+    wrap.scrollIntoView();
+    return text;
+  };
+
+  const showTranslated = async (el, original) => {
+    try {
+      el.textContent = await translateText(original);
+    } catch (e) {
+      el.textContent = original;
+      el.title = "Could not be translated";
+      statusEl.textContent = "Some messages could not be translated right now and are shown as sent.";
+    }
+    el.classList.remove("pending");
+    el.parentElement.scrollIntoView();
+  };
+
+  socketio.on("message", (data) => {
+    const el = addBubble(data.name, data.name === username && !data.notice);
+    showTranslated(el, data.message);
+  });
+
+  socketio.on("pdf_message", async (data) => {
+    const el = addBubble(data.name, data.name === username);
+    const outName = data.filename.replace(/\.pdf$/i, "") + "_" + myLanguage + ".txt";
+    el.textContent = "Translating " + data.filename + "…";
+    let body;
+    try {
+      body = await translateText(data.text);
+    } catch (e) {
+      body = data.text;
+      statusEl.textContent = data.filename + " could not be translated right now; the original text is attached.";
+    }
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([body], { type: "text/plain;charset=utf-8" }));
+    link.download = outName;
+    link.textContent = "Download " + outName;
+    el.textContent = "";
+    el.classList.remove("pending");
+    el.appendChild(link);
+    el.parentElement.scrollIntoView();
+  });
+
+  socketio.on("status", (data) => { statusEl.textContent = data.message || ""; });
+  socketio.on("server_error", (data) => { statusEl.textContent = data.message; });
+
+  // ---------------------------------------------------------------- sending
+
+  const sendMessage = () => {
+    const message = document.getElementById("message");
+    if (message.value.trim() === "") return;
+    socketio.emit("message", { data: message.value });
+    message.value = "";
+  };
+
+  document.getElementById("message").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+
+  const leaveRoom = () => {
+    leaving = true;
+    socketio.disconnect();
+    window.location.href = "/";
+  };
+
+  socketio.on("disconnect", () => {
+    if (leaving) return;
+    statusEl.textContent = "Connection lost. Reconnecting…";
+  });
+  socketio.on("connect", () => { statusEl.textContent = ""; });
+
+  document.getElementById("file-input").addEventListener("change", function () {
+    const file = this.files[0];
+    this.value = "";
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      statusEl.textContent = "Please select a .pdf file.";
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      statusEl.textContent = "That PDF is too large (10 MB maximum).";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      statusEl.textContent = "Uploading " + file.name + "…";
+      socketio.emit("pdf_file", { filename: file.name, content: reader.result });
+    };
+    reader.readAsArrayBuffer(file);
+  });
+</script>
+{% endblock %}

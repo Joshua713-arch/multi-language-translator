@@ -1,27 +1,30 @@
 """Multi-Language Translator: a real-time multilingual chat server.
 
-Users create or join a room, pick a language, and every message (and every
-shared PDF) is delivered to each member translated into their own language.
+Users create or join a room and pick a language. The server relays each
+message (and the text of each shared PDF) to everyone in the room, and each
+person's browser translates it into their own language.
+
+Translation normally runs in the browser, so every user's requests go to
+Google from their own internet connection. Shared cloud hosts such as Render
+are often rate-limited by Google; if a browser can't translate, it asks this
+server to try instead.
 """
 
 import logging
 import os
 import random
-import re
 import secrets
-import shutil
 import threading
 from functools import lru_cache
+from io import BytesIO
 from string import ascii_uppercase, digits
 
 import requests
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-from flask import (Flask, abort, redirect, render_template, request,
-                   send_from_directory, session, url_for)
+from flask import Flask, redirect, render_template, request, session, url_for
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from pypdf import PdfReader
-from io import BytesIO
 
 load_dotenv()
 
@@ -30,18 +33,14 @@ log = logging.getLogger("mlt")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
 MAX_PDF_BYTES = 10 * 1024 * 1024       # largest PDF accepted
+MAX_PDF_CHARS = 200_000                # longest PDF text relayed to the room
 MAX_MESSAGE_CHARS = 2000               # longest chat message accepted
-CHUNK_CHARS = 1500                     # keeps each translation request small and reliable
+CHUNK_CHARS = 1500                     # keeps each server translation request small
 ROOM_GRACE_SECONDS = int(os.environ.get("ROOM_GRACE_SECONDS", 120))  # how long an empty room survives
 
 socketio = SocketIO(app, async_mode="threading", max_http_buffer_size=MAX_PDF_BYTES + 1024 * 1024)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILES_DIR = os.path.join(BASE_DIR, "translated_files")
-os.makedirs(FILES_DIR, exist_ok=True)
 
 # name -> code, e.g. {"english": "en", "twi": "ak", ...}
 LANGUAGES = GoogleTranslator().get_supported_languages(as_dict=True)
@@ -66,7 +65,7 @@ def generate_unique_id(length=8):
 
 
 def split_text(text, limit=CHUNK_CHARS):
-    """Split long text into chunks under the API limit, preferring line breaks."""
+    """Split long text into chunks under the limit, preferring line breaks."""
     chunks, current = [], ""
     for line in text.splitlines(keepends=True):
         while len(line) > limit:                      # a single very long line
@@ -84,6 +83,9 @@ def split_text(text, limit=CHUNK_CHARS):
     return chunks
 
 
+# ------------------------------------------------- server-side translation
+# Used only when a browser can't translate on its own.
+
 GTX_URL = "https://translate.googleapis.com/translate_a/single"
 HTTP = requests.Session()
 HTTP.headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -92,7 +94,7 @@ last_translation_error = {"error": None}
 
 
 def translate_gtx(text, dest):
-    """Google Translate's public JSON endpoint (the one used by browser extensions)."""
+    """Google Translate's public JSON endpoint."""
     resp = HTTP.post(GTX_URL, params={"client": "gtx", "sl": "auto", "tl": dest, "dt": "t"},
                      data={"q": text}, timeout=15)
     resp.raise_for_status()
@@ -101,7 +103,7 @@ def translate_gtx(text, dest):
 
 
 def translate_deep(text, dest):
-    """Fallback: deep-translator's Google Translate web scraper."""
+    """Backup: deep-translator's Google Translate web scraper."""
     return GoogleTranslator(source="auto", target=dest).translate(text)
 
 
@@ -120,38 +122,23 @@ def translate_chunk(text, dest):
 
 
 def translate(text, dest):
-    """Translate text into `dest`, auto-detecting the source. Falls back to the original on failure."""
+    """Translate text into `dest`, auto-detecting the source. Raises on failure."""
     if not text or not text.strip():
         return text
     try:
         result = "".join(translate_chunk(chunk, dest) for chunk in split_text(text))
         last_translation_error["error"] = None
         return result
-    except Exception as exc:                          # network error, rate limit, etc.
+    except Exception as exc:
         last_translation_error["error"] = str(exc)[:500]
-        log.warning("Translation to %s failed: %s", dest, exc)
-        return text
+        log.warning("Server translation to %s failed: %s", dest, exc)
+        raise
 
 
-def translate_for_members(text, members):
-    """Translate once per distinct language in the room; return {language: translation}."""
-    return {lang: translate(text, lang) for lang in {m["language"] for m in members.values()}}
-
-
-def room_dir(room):
-    return os.path.join(FILES_DIR, room)
-
-
-def safe_filename(name):
-    name = os.path.basename(name or "document.pdf")
-    stem = re.sub(r"\.pdf$", "", name, flags=re.IGNORECASE)
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "document"
-    return stem[:80]
-
+# ------------------------------------------------------------ room cleanup
 
 def delete_room(room):
     rooms.pop(room, None)
-    shutil.rmtree(room_dir(room), ignore_errors=True)
     log.info("Room %s deleted", room)
 
 
@@ -218,23 +205,20 @@ def room():
 
 @app.route("/translate-test")
 def translate_test():
-    """Open this page to check that translation works on the server."""
+    """Check whether the SERVER can reach Google Translate.
+
+    On shared hosts this often fails with 429 (Too Many Requests). That is
+    fine: browsers translate for themselves and only fall back to the server.
+    """
     results = {}
     for engine in (translate_gtx, translate_deep):
         try:
             results[engine.__name__] = engine("Hello, how is your day going?", "de")
         except Exception as exc:
             results[engine.__name__] = f"FAILED: {type(exc).__name__}: {exc}"[:300]
-    return {"input": "Hello, how is your day going?", "target": "de", "results": results,
-            "last_chat_error": last_translation_error["error"]}
-
-
-@app.route("/files/<room>/<path:filename>")
-def download_file(room, filename):
-    # Only members of the room can download its files.
-    if session.get("room") != room or room not in rooms:
-        abort(404)
-    return send_from_directory(room_dir(room), filename, as_attachment=True)
+    return {"input": "Hello, how is your day going?", "target": "de", "server_results": results,
+            "last_server_error": last_translation_error["error"],
+            "note": "Server failures are OK: translation runs in each user's browser first."}
 
 
 # ---------------------------------------------------------- socket events
@@ -243,7 +227,6 @@ def download_file(room, filename):
 def connect(auth=None):
     room = session.get("room")
     name = session.get("name")
-    language = session.get("language")
     if not room or not name:
         return False
     with rooms_lock:
@@ -251,19 +234,15 @@ def connect(auth=None):
             return False
         join_room(room)
         rooms[room]["members"][request.sid] = {
-            "name": name, "language": language, "user_id": session.get("user_id")}
+            "name": name, "language": session.get("language"), "user_id": session.get("user_id")}
         history = list(rooms[room]["messages"])
-        members = dict(rooms[room]["members"])
 
-    # Earlier chat history, translated for the newcomer.
+    # Earlier chat history for the newcomer; their browser translates it.
     for message in history:
-        emit("message", {"name": message["name"],
-                         "message": translate(message["message"], language)}, to=request.sid)
+        emit("message", {"name": message["name"], "message": message["message"]}, to=request.sid)
 
-    notices = translate_for_members("has entered the room", members)
-    for sid, member in members.items():
-        emit("message", {"name": name, "message": notices[member["language"]], "notice": True}, to=sid)
-    log.info("%s joined room %s (%s)", name, room, language)
+    emit("message", {"name": name, "message": "has entered the room", "notice": True}, to=room)
+    log.info("%s joined room %s (%s)", name, room, session.get("language"))
 
 
 @socketio.on("message")
@@ -276,12 +255,20 @@ def handle_message(data):
         if room not in rooms:
             return
         rooms[room]["messages"].append({"name": session.get("name"), "message": text})
-        members = dict(rooms[room]["members"])
+    emit("message", {"name": session.get("name"), "message": text}, to=room)
 
-    translations = translate_for_members(text, members)
-    for sid, member in members.items():
-        emit("message", {"name": session.get("name"),
-                         "message": translations[member["language"]]}, to=sid)
+
+@socketio.on("translate")
+def handle_translate(data):
+    """Fallback translation for a browser that couldn't reach Google itself."""
+    text = str((data or {}).get("text", ""))[:20000]
+    dest = (data or {}).get("dest") or session.get("language") or "en"
+    if dest not in LANGUAGE_CODES:
+        return {"ok": False, "error": "unknown language"}
+    try:
+        return {"ok": True, "text": translate(text, dest)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
 
 
 @socketio.on("pdf_file")
@@ -290,7 +277,7 @@ def handle_pdf_file(data):
     if room not in rooms:
         return
     content = (data or {}).get("content")
-    filename = (data or {}).get("filename", "")
+    filename = os.path.basename(str((data or {}).get("filename", "")))
 
     if not isinstance(content, (bytes, bytearray)) or not filename.lower().endswith(".pdf"):
         emit("server_error", {"message": "Please attach a .pdf file."})
@@ -310,26 +297,10 @@ def handle_pdf_file(data):
         emit("server_error", {"message": "No text could be found in that PDF."})
         return
 
-    emit("status", {"message": f"Translating {filename}…"})
-    with rooms_lock:
-        members = dict(rooms.get(room, {}).get("members", {}))
-    translations = translate_for_members(text, members)
-
-    os.makedirs(room_dir(room), exist_ok=True)
-    stem = safe_filename(filename)
-    file_id = generate_unique_id(6)
-    for sid, member in members.items():
-        lang = member["language"]
-        out_name = f"{stem}_{lang}.txt"
-        stored = f"{file_id}_{out_name}"
-        path = os.path.join(room_dir(room), stored)
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(translations[lang])
-        emit("pdf_message", {"name": session.get("name"), "filename": out_name,
-                             "file_url": url_for("download_file", room=room, filename=stored)}, to=sid)
     emit("status", {"message": ""})
-    log.info("Translated %s for room %s into %s", filename, room, ", ".join(translations))
+    emit("pdf_message", {"name": session.get("name"), "filename": filename,
+                         "text": text[:MAX_PDF_CHARS]}, to=room)
+    log.info("%s shared %s in room %s", session.get("name"), filename, room)
 
 
 @socketio.on("disconnect")
@@ -341,15 +312,12 @@ def disconnect(reason=None):
         if room not in rooms:
             return
         rooms[room]["members"].pop(request.sid, None)
-        members = dict(rooms[room]["members"])
-        if not members:
+        if not rooms[room]["members"]:
             log.info("Room %s is empty; deleting in %s seconds unless someone rejoins", room, ROOM_GRACE_SECONDS)
             socketio.start_background_task(delete_room_if_still_empty, room)
             return
 
-    notices = translate_for_members("has left the room", members)
-    for sid, member in members.items():
-        emit("message", {"name": name, "message": notices[member["language"]], "notice": True}, to=sid)
+    emit("message", {"name": name, "message": "has left the room", "notice": True}, to=room)
     log.info("%s left room %s", name, room)
 
 
