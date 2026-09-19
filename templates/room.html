@@ -18,40 +18,144 @@
   const messages = document.getElementById("messages");
   const statusEl = document.getElementById("status");
   const username = {{ session['name'] | tojson }};
+  const myLanguage = {{ session['language'] | tojson }};
   let leaving = false;
 
+  // ------------------------------------------------------------ translation
+  // Each browser translates into its own language using Google Translate,
+  // so requests come from each user's own internet connection. If that
+  // fails, the server is asked to translate instead.
+
+  const cache = new Map();
+  let browserCanTranslate = true;
+
+  const splitText = (text, limit = 1000) => {
+    const chunks = [];
+    let current = "";
+    for (let line of text.split(/(?<=\n)/)) {
+      while (line.length > limit) {
+        if (current) { chunks.push(current); current = ""; }
+        chunks.push(line.slice(0, limit));
+        line = line.slice(limit);
+      }
+      if (current.length + line.length > limit) { chunks.push(current); current = ""; }
+      current += line;
+    }
+    if (current.trim()) chunks.push(current);
+    return chunks;
+  };
+
+  const googleInBrowser = async (text) => {
+    const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t"
+      + "&tl=" + encodeURIComponent(myLanguage) + "&q=" + encodeURIComponent(text);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    return data[0].map((part) => part[0] || "").join("");
+  };
+
+  const viaServer = (text, source) => new Promise((resolve, reject) => {
+    socketio.timeout(60000).emit("translate", { text, dest: myLanguage, source }, (err, resp) => {
+      if (err) reject(new Error("the server did not answer"));
+      else if (!resp || !resp.ok) reject(new Error((resp && resp.error) || "server translation failed"));
+      else resolve(resp.text);
+    });
+  });
+
+  let lastBrowserError = "";
+  const translateChunk = async (text, source) => {
+    if (browserCanTranslate) {
+      try {
+        return await googleInBrowser(text);
+      } catch (e) {
+        lastBrowserError = e.message || String(e);
+        // TypeError = blocked or offline: stop trying from the browser for this visit.
+        if (e instanceof TypeError) browserCanTranslate = false;
+      }
+    }
+    return await viaServer(text, source);
+  };
+
+  const translateText = async (text, source) => {
+    if (!text || !text.trim()) return text;
+    if (source && source === myLanguage) return text;          // already in my language
+    const key = (source || "") + "|" + text;
+    if (cache.has(key)) return cache.get(key);
+    const parts = [];
+    for (const chunk of splitText(text)) parts.push(await translateChunk(chunk, source));
+    const result = parts.join("");
+    cache.set(key, result);
+    return result;
+  };
+
+  const showError = (what, e) => {
+    const detail = (e && e.message) || String(e);
+    statusEl.textContent = what + " could not be translated. Browser: " + (lastBrowserError || "ok")
+      + ". Server: " + detail.slice(0, 300);
+  };
+
+  // ------------------------------------------------------------- rendering
   // Build each message with textContent so user input is never run as HTML.
-  const createMessage = (name, msg, isOwnMessage, fileUrl) => {
+  // The bubble is added immediately and filled in once translated, so
+  // messages always stay in the order they were sent.
+
+  const addBubble = (name, isOwnMessage) => {
     const wrap = document.createElement("div");
     wrap.className = "message " + (isOwnMessage ? "text-right" : "text-left");
     const who = document.createElement("div");
     who.className = "name";
     who.textContent = name;
     const text = document.createElement("div");
-    text.className = "text";
-    if (fileUrl) {
-      const a = document.createElement("a");
-      a.href = fileUrl;
-      a.textContent = "Download " + msg;
-      text.appendChild(a);
-    } else {
-      text.textContent = msg;
-    }
+    text.className = "text pending";
+    text.textContent = "translating…";
     wrap.append(who, text);
     messages.appendChild(wrap);
     wrap.scrollIntoView();
+    return text;
+  };
+
+  const showTranslated = async (el, original, source) => {
+    try {
+      el.textContent = await translateText(original, source);
+    } catch (e) {
+      el.textContent = original;
+      el.title = "Could not be translated";
+      showError("A message", e);
+    }
+    el.classList.remove("pending");
+    el.parentElement.scrollIntoView();
   };
 
   socketio.on("message", (data) => {
-    createMessage(data.name, data.message, data.name === username && !data.notice);
+    const el = addBubble(data.name, data.name === username && !data.notice);
+    showTranslated(el, data.message, data.lang);
   });
 
-  socketio.on("pdf_message", (data) => {
-    createMessage(data.name, data.filename, data.name === username, data.file_url);
+  socketio.on("pdf_message", async (data) => {
+    const el = addBubble(data.name, data.name === username);
+    const outName = data.filename.replace(/\.pdf$/i, "") + "_" + myLanguage + ".txt";
+    el.textContent = "Translating " + data.filename + "…";
+    let body;
+    try {
+      body = await translateText(data.text, data.lang);
+    } catch (e) {
+      body = data.text;
+      showError(data.filename, e);
+    }
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(new Blob([body], { type: "text/plain;charset=utf-8" }));
+    link.download = outName;
+    link.textContent = "Download " + outName;
+    el.textContent = "";
+    el.classList.remove("pending");
+    el.appendChild(link);
+    el.parentElement.scrollIntoView();
   });
 
   socketio.on("status", (data) => { statusEl.textContent = data.message || ""; });
   socketio.on("server_error", (data) => { statusEl.textContent = data.message; });
+
+  // ---------------------------------------------------------------- sending
 
   const sendMessage = () => {
     const message = document.getElementById("message");
