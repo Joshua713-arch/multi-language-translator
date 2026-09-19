@@ -14,6 +14,7 @@ import threading
 from functools import lru_cache
 from string import ascii_uppercase, digits
 
+import requests
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 from flask import (Flask, abort, redirect, render_template, request,
@@ -33,7 +34,7 @@ app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
 MAX_PDF_BYTES = 10 * 1024 * 1024       # largest PDF accepted
 MAX_MESSAGE_CHARS = 2000               # longest chat message accepted
-CHUNK_CHARS = 4500                     # Google Translate rejects requests over 5000 chars
+CHUNK_CHARS = 1500                     # keeps each translation request small and reliable
 ROOM_GRACE_SECONDS = int(os.environ.get("ROOM_GRACE_SECONDS", 120))  # how long an empty room survives
 
 socketio = SocketIO(app, async_mode="threading", max_http_buffer_size=MAX_PDF_BYTES + 1024 * 1024)
@@ -83,9 +84,39 @@ def split_text(text, limit=CHUNK_CHARS):
     return chunks
 
 
+GTX_URL = "https://translate.googleapis.com/translate_a/single"
+HTTP = requests.Session()
+HTTP.headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+last_translation_error = {"error": None}
+
+
+def translate_gtx(text, dest):
+    """Google Translate's public JSON endpoint (the one used by browser extensions)."""
+    resp = HTTP.post(GTX_URL, params={"client": "gtx", "sl": "auto", "tl": dest, "dt": "t"},
+                     data={"q": text}, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    return "".join(part[0] for part in data[0] if part and part[0])
+
+
+def translate_deep(text, dest):
+    """Fallback: deep-translator's Google Translate web scraper."""
+    return GoogleTranslator(source="auto", target=dest).translate(text)
+
+
 @lru_cache(maxsize=4096)
 def translate_chunk(text, dest):
-    return GoogleTranslator(source="auto", target=dest).translate(text) or text
+    errors = []
+    for engine in (translate_gtx, translate_deep):
+        try:
+            result = engine(text, dest)
+            if result:
+                return result
+            errors.append(f"{engine.__name__}: empty result")
+        except Exception as exc:
+            errors.append(f"{engine.__name__}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(" | ".join(errors))
 
 
 def translate(text, dest):
@@ -93,8 +124,11 @@ def translate(text, dest):
     if not text or not text.strip():
         return text
     try:
-        return "".join(translate_chunk(chunk, dest) for chunk in split_text(text))
+        result = "".join(translate_chunk(chunk, dest) for chunk in split_text(text))
+        last_translation_error["error"] = None
+        return result
     except Exception as exc:                          # network error, rate limit, etc.
+        last_translation_error["error"] = str(exc)[:500]
         log.warning("Translation to %s failed: %s", dest, exc)
         return text
 
@@ -180,6 +214,19 @@ def room():
     if room is None or session.get("name") is None or room not in rooms:
         return redirect(url_for("home"))
     return render_template("room.html", code=room)
+
+
+@app.route("/translate-test")
+def translate_test():
+    """Open this page to check that translation works on the server."""
+    results = {}
+    for engine in (translate_gtx, translate_deep):
+        try:
+            results[engine.__name__] = engine("Hello, how is your day going?", "de")
+        except Exception as exc:
+            results[engine.__name__] = f"FAILED: {type(exc).__name__}: {exc}"[:300]
+    return {"input": "Hello, how is your day going?", "target": "de", "results": results,
+            "last_chat_error": last_translation_error["error"]}
 
 
 @app.route("/files/<room>/<path:filename>")
