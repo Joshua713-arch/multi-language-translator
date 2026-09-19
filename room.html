@@ -54,33 +54,44 @@
     return data[0].map((part) => part[0] || "").join("");
   };
 
-  const viaServer = (text) => new Promise((resolve, reject) => {
-    socketio.timeout(30000).emit("translate", { text, dest: myLanguage }, (err, resp) => {
-      if (err || !resp || !resp.ok) reject(new Error((resp && resp.error) || "server translation failed"));
+  const viaServer = (text, source) => new Promise((resolve, reject) => {
+    socketio.timeout(60000).emit("translate", { text, dest: myLanguage, source }, (err, resp) => {
+      if (err) reject(new Error("the server did not answer"));
+      else if (!resp || !resp.ok) reject(new Error((resp && resp.error) || "server translation failed"));
       else resolve(resp.text);
     });
   });
 
-  const translateChunk = async (text) => {
+  let lastBrowserError = "";
+  const translateChunk = async (text, source) => {
     if (browserCanTranslate) {
       try {
         return await googleInBrowser(text);
       } catch (e) {
+        lastBrowserError = e.message || String(e);
         // TypeError = blocked or offline: stop trying from the browser for this visit.
         if (e instanceof TypeError) browserCanTranslate = false;
       }
     }
-    return await viaServer(text);
+    return await viaServer(text, source);
   };
 
-  const translateText = async (text) => {
+  const translateText = async (text, source) => {
     if (!text || !text.trim()) return text;
-    if (cache.has(text)) return cache.get(text);
+    if (source && source === myLanguage) return text;          // already in my language
+    const key = (source || "") + "|" + text;
+    if (cache.has(key)) return cache.get(key);
     const parts = [];
-    for (const chunk of splitText(text)) parts.push(await translateChunk(chunk));
+    for (const chunk of splitText(text)) parts.push(await translateChunk(chunk, source));
     const result = parts.join("");
-    cache.set(text, result);
+    cache.set(key, result);
     return result;
+  };
+
+  const showError = (what, e) => {
+    const detail = (e && e.message) || String(e);
+    statusEl.textContent = what + " could not be translated. Browser: " + (lastBrowserError || "ok")
+      + ". Server: " + detail.slice(0, 300);
   };
 
   // ------------------------------------------------------------- rendering
@@ -103,13 +114,13 @@
     return text;
   };
 
-  const showTranslated = async (el, original) => {
+  const showTranslated = async (el, original, source) => {
     try {
-      el.textContent = await translateText(original);
+      el.textContent = await translateText(original, source);
     } catch (e) {
       el.textContent = original;
       el.title = "Could not be translated";
-      statusEl.textContent = "Some messages could not be translated right now and are shown as sent.";
+      showError("A message", e);
     }
     el.classList.remove("pending");
     el.parentElement.scrollIntoView();
@@ -117,7 +128,7 @@
 
   socketio.on("message", (data) => {
     const el = addBubble(data.name, data.name === username && !data.notice);
-    showTranslated(el, data.message);
+    showTranslated(el, data.message, data.lang);
   });
 
   socketio.on("pdf_message", async (data) => {
@@ -126,10 +137,10 @@
     el.textContent = "Translating " + data.filename + "…";
     let body;
     try {
-      body = await translateText(data.text);
+      body = await translateText(data.text, data.lang);
     } catch (e) {
       body = data.text;
-      statusEl.textContent = data.filename + " could not be translated right now; the original text is attached.";
+      showError(data.filename, e);
     }
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([body], { type: "text/plain;charset=utf-8" }));

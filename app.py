@@ -7,7 +7,8 @@ person's browser translates it into their own language.
 Translation normally runs in the browser, so every user's requests go to
 Google from their own internet connection. Shared cloud hosts such as Render
 are often rate-limited by Google; if a browser can't translate, it asks this
-server to try instead.
+server, which tries Google and then MyMemory (a free service that is not
+Google and works from cloud servers).
 """
 
 import logging
@@ -90,6 +91,9 @@ GTX_URL = "https://translate.googleapis.com/translate_a/single"
 HTTP = requests.Session()
 HTTP.headers["User-Agent"] = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL", "").strip()   # raises the free daily limit 10x
+MYMEMORY_CHUNK_BYTES = 450                                        # MyMemory accepts up to 500 bytes
 last_translation_error = {"error": None}
 
 
@@ -107,26 +111,86 @@ def translate_deep(text, dest):
     return GoogleTranslator(source="auto", target=dest).translate(text)
 
 
+def split_bytes(text, limit=MYMEMORY_CHUNK_BYTES):
+    """Split text into pieces of at most `limit` UTF-8 bytes, breaking at spaces where possible."""
+    pieces, current = [], ""
+    for word in text.split(" "):
+        candidate = f"{current} {word}" if current else word
+        if len(candidate.encode("utf-8")) <= limit:
+            current = candidate
+            continue
+        if current:
+            pieces.append(current)
+        while len(word.encode("utf-8")) > limit:        # one enormous "word"
+            cut = limit
+            while len(word[:cut].encode("utf-8")) > limit:
+                cut -= 1
+            pieces.append(word[:cut])
+            word = word[cut:]
+        current = word
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def translate_mymemory(text, dest, source):
+    """MyMemory translation API. Needs the source language (its auto-detect is unreliable)."""
+    if not source or source == dest:
+        return text
+    out = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append(line)
+            continue
+        parts = []
+        for piece in split_bytes(line):
+            params = {"q": piece, "langpair": f"{source}|{dest}"}
+            if MYMEMORY_EMAIL:
+                params["de"] = MYMEMORY_EMAIL
+            resp = HTTP.get(MYMEMORY_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if str(data.get("responseStatus")) != "200":
+                raise RuntimeError(f"MyMemory {data.get('responseStatus')}: {data.get('responseDetails')}")
+            parts.append(data["responseData"]["translatedText"])
+        out.append(" ".join(parts))
+    return "\n".join(out)
+
+
+google_blocked_until = {"t": 0.0}   # skip Google for a while after it answers 429
+
+
 @lru_cache(maxsize=4096)
-def translate_chunk(text, dest):
+def translate_chunk(text, dest, source=None):
+    import time
     errors = []
-    for engine in (translate_gtx, translate_deep):
+    engines = [("google", lambda: translate_gtx(text, dest)),
+               ("google-scraper", lambda: translate_deep(text, dest)),
+               ("mymemory", lambda: translate_mymemory(text, dest, source))]
+    for name, run in engines:
+        if name.startswith("google") and time.time() < google_blocked_until["t"]:
+            errors.append(f"{name}: skipped (rate-limited recently)")
+            continue
         try:
-            result = engine(text, dest)
+            result = run()
             if result:
                 return result
-            errors.append(f"{engine.__name__}: empty result")
+            errors.append(f"{name}: empty result")
         except Exception as exc:
-            errors.append(f"{engine.__name__}: {type(exc).__name__}: {exc}")
+            if name.startswith("google") and ("429" in str(exc) or "TooManyRequests" in type(exc).__name__):
+                google_blocked_until["t"] = time.time() + 600
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
     raise RuntimeError(" | ".join(errors))
 
 
-def translate(text, dest):
-    """Translate text into `dest`, auto-detecting the source. Raises on failure."""
+def translate(text, dest, source=None):
+    """Translate text into `dest`. `source` is the sender's language (needed by MyMemory)."""
     if not text or not text.strip():
         return text
+    if source == dest:
+        return text
     try:
-        result = "".join(translate_chunk(chunk, dest) for chunk in split_text(text))
+        result = "".join(translate_chunk(chunk, dest, source) for chunk in split_text(text))
         last_translation_error["error"] = None
         return result
     except Exception as exc:
@@ -211,14 +275,18 @@ def translate_test():
     fine: browsers translate for themselves and only fall back to the server.
     """
     results = {}
-    for engine in (translate_gtx, translate_deep):
+    tests = [("google", lambda t: translate_gtx(t, "de")),
+             ("google-scraper", lambda t: translate_deep(t, "de")),
+             ("mymemory", lambda t: translate_mymemory(t, "de", "en"))]
+    for name, run in tests:
         try:
-            results[engine.__name__] = engine("Hello, how is your day going?", "de")
+            results[name] = run("Hello, how is your day going?")
         except Exception as exc:
-            results[engine.__name__] = f"FAILED: {type(exc).__name__}: {exc}"[:300]
+            results[name] = f"FAILED: {type(exc).__name__}: {exc}"[:300]
     return {"input": "Hello, how is your day going?", "target": "de", "server_results": results,
             "last_server_error": last_translation_error["error"],
-            "note": "Server failures are OK: translation runs in each user's browser first."}
+            "mymemory_email_set": bool(MYMEMORY_EMAIL),
+            "note": "Chat works if at least one of these succeeds, or if browsers can reach Google."}
 
 
 # ---------------------------------------------------------- socket events
@@ -239,9 +307,10 @@ def connect(auth=None):
 
     # Earlier chat history for the newcomer; their browser translates it.
     for message in history:
-        emit("message", {"name": message["name"], "message": message["message"]}, to=request.sid)
+        emit("message", {"name": message["name"], "message": message["message"],
+                         "lang": message.get("lang")}, to=request.sid)
 
-    emit("message", {"name": name, "message": "has entered the room", "notice": True}, to=room)
+    emit("message", {"name": name, "message": "has entered the room", "notice": True, "lang": "en"}, to=room)
     log.info("%s joined room %s (%s)", name, room, session.get("language"))
 
 
@@ -254,8 +323,9 @@ def handle_message(data):
     with rooms_lock:
         if room not in rooms:
             return
-        rooms[room]["messages"].append({"name": session.get("name"), "message": text})
-    emit("message", {"name": session.get("name"), "message": text}, to=room)
+        rooms[room]["messages"].append({"name": session.get("name"), "message": text,
+                                        "lang": session.get("language")})
+    emit("message", {"name": session.get("name"), "message": text, "lang": session.get("language")}, to=room)
 
 
 @socketio.on("translate")
@@ -263,10 +333,13 @@ def handle_translate(data):
     """Fallback translation for a browser that couldn't reach Google itself."""
     text = str((data or {}).get("text", ""))[:20000]
     dest = (data or {}).get("dest") or session.get("language") or "en"
+    source = (data or {}).get("source")
     if dest not in LANGUAGE_CODES:
         return {"ok": False, "error": "unknown language"}
+    if source not in LANGUAGE_CODES:
+        source = None
     try:
-        return {"ok": True, "text": translate(text, dest)}
+        return {"ok": True, "text": translate(text, dest, source)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:200]}
 
@@ -299,7 +372,7 @@ def handle_pdf_file(data):
 
     emit("status", {"message": ""})
     emit("pdf_message", {"name": session.get("name"), "filename": filename,
-                         "text": text[:MAX_PDF_CHARS]}, to=room)
+                         "text": text[:MAX_PDF_CHARS], "lang": session.get("language")}, to=room)
     log.info("%s shared %s in room %s", session.get("name"), filename, room)
 
 
@@ -317,7 +390,7 @@ def disconnect(reason=None):
             socketio.start_background_task(delete_room_if_still_empty, room)
             return
 
-    emit("message", {"name": name, "message": "has left the room", "notice": True}, to=room)
+    emit("message", {"name": name, "message": "has left the room", "notice": True, "lang": "en"}, to=room)
     log.info("%s left room %s", name, room)
 
 
