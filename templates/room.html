@@ -1,0 +1,102 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="message-box">
+  <button type="button" id="leave-btn" class="btn red" onclick="leaveRoom()">Leave Room</button>
+  <h2>Chat Room: {{ code }}</h2>
+  <div class="messages" id="messages"></div>
+  <div class="inputs">
+    <input type="file" id="file-input" accept=".pdf" hidden>
+    <button type="button" id="attach-btn" class="btn blue" onclick="document.getElementById('file-input').click()">Attach .pdf</button>
+    <input type="text" placeholder="Message" name="message" id="message" autocomplete="off" maxlength="2000">
+    <button type="button" id="send-btn" class="btn green" onclick="sendMessage()">Send</button>
+  </div>
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+  const socketio = io();
+  const messages = document.getElementById("messages");
+  const statusEl = document.getElementById("status");
+  const username = {{ session['name'] | tojson }};
+  let leaving = false;
+
+  // Build each message with textContent so user input is never run as HTML.
+  const createMessage = (name, msg, isOwnMessage, fileUrl) => {
+    const wrap = document.createElement("div");
+    wrap.className = "message " + (isOwnMessage ? "text-right" : "text-left");
+    const who = document.createElement("div");
+    who.className = "name";
+    who.textContent = name;
+    const text = document.createElement("div");
+    text.className = "text";
+    if (fileUrl) {
+      const a = document.createElement("a");
+      a.href = fileUrl;
+      a.textContent = "Download " + msg;
+      text.appendChild(a);
+    } else {
+      text.textContent = msg;
+    }
+    wrap.append(who, text);
+    messages.appendChild(wrap);
+    wrap.scrollIntoView();
+  };
+
+  socketio.on("message", (data) => {
+    createMessage(data.name, data.message, data.name === username && !data.notice);
+  });
+
+  socketio.on("pdf_message", (data) => {
+    createMessage(data.name, data.filename, data.name === username, data.file_url);
+  });
+
+  socketio.on("status", (data) => { statusEl.textContent = data.message || ""; });
+  socketio.on("server_error", (data) => { statusEl.textContent = data.message; });
+
+  const sendMessage = () => {
+    const message = document.getElementById("message");
+    if (message.value.trim() === "") return;
+    socketio.emit("message", { data: message.value });
+    message.value = "";
+  };
+
+  document.getElementById("message").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+
+  const leaveRoom = () => {
+    leaving = true;
+    socketio.disconnect();
+    window.location.href = "/";
+  };
+
+  socketio.on("disconnect", () => {
+    if (leaving) return;
+    statusEl.textContent = "Connection lost. Reconnecting…";
+  });
+  socketio.on("connect", () => { statusEl.textContent = ""; });
+
+  document.getElementById("file-input").addEventListener("change", function () {
+    const file = this.files[0];
+    this.value = "";
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      statusEl.textContent = "Please select a .pdf file.";
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      statusEl.textContent = "That PDF is too large (10 MB maximum).";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      statusEl.textContent = "Uploading " + file.name + "…";
+      socketio.emit("pdf_file", { filename: file.name, content: reader.result });
+    };
+    reader.readAsArrayBuffer(file);
+  });
+</script>
+{% endblock %}
